@@ -1,10 +1,14 @@
 use std::sync::LazyLock;
 
+use bitcode::{Decode, Encode};
+use futures::{stream::select, SinkExt, StreamExt};
 use iced::advanced::graphics::core::Element;
-use iced::widget::container;
+use iced::widget::{column, container, progress_bar, row, text, Button};
 use iced::window::{icon, Position};
-use iced::{window, Color, Font, Length, Size, Subscription, Task, Theme};
+use iced::{stream, window, Font, Length, Size, Subscription, Task, Theme};
 use iced_term::TerminalView;
+
+use crate::ipc::{self, Recv};
 
 static ICON: LazyLock<icon::Icon> = LazyLock::new(|| {
 	use iced::advanced::graphics::image::image_rs::ImageFormat;
@@ -16,14 +20,29 @@ static ICON: LazyLock<icon::Icon> = LazyLock::new(|| {
 	.expect("failed to load icon data")
 });
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Encode, Decode)]
+pub enum IpcRequest {
+	SetStatus(String),
+	SetProgress(f32),
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub enum IpcResponse {}
+
+#[derive(Clone, Debug)]
 pub enum Event {
 	Terminal(iced_term::Event),
+	IpcError(String),
+	Ipc(IpcRequest),
+	Toggle,
 }
 
 struct App {
 	title: String,
 	term: iced_term::Terminal,
+	status: String,
+	progress: f32,
+	expanded: bool,
 }
 
 impl App {
@@ -35,7 +54,8 @@ impl App {
 		} else {
 			"gmodpatchtool".to_owned()
 		};
-		let args = std::env::args().skip(1).collect::<Vec<String>>();
+		let mut args = std::env::args().skip(1).collect::<Vec<String>>();
+		args.push("--enable-ipc".to_owned());
 
 		let term_id = 0;
 		let term_settings = iced_term::settings::Settings {
@@ -72,6 +92,9 @@ impl App {
 			Self {
 				title: String::from("GModPatchTool"),
 				term: iced_term::Terminal::new(term_id, term_settings),
+				status: "Starting...".to_owned(),
+				progress: 0.0,
+				expanded: false,
 			},
 			Task::none(),
 		)
@@ -83,12 +106,58 @@ impl App {
 
 	fn subscription(&self) -> Subscription<Event> {
 		let term_subscription = iced_term::Subscription::new(self.term.id);
-		let term_event_stream = term_subscription.event_stream();
-		Subscription::run_with_id(self.term.id, term_event_stream).map(Event::Terminal)
+		let term_event_stream = term_subscription.event_stream().map(Event::Terminal);
+
+		let ipc_event_stream = stream::channel(1024, |mut tx| async move {
+			let mut server = match ipc::listen::<IpcRequest, IpcResponse>().await {
+				Ok(server) => server,
+				Err(error) => {
+					let _ = tx.send(Event::IpcError(error.to_string())).await;
+					return;
+				}
+			};
+
+			loop {
+				let request = match server.recv().await {
+					Ok(Some(request)) => request,
+					// If this is `None`, it means the client side disconnected.
+					Ok(None) => break,
+					Err(error) => {
+						if tx.send(Event::IpcError(error.to_string())).await.is_err() {
+							break;
+						}
+						continue;
+					}
+				};
+
+				if tx.send(Event::Ipc(request)).await.is_err() {
+					// If this is an error, it means the GUI subscription dropped.
+					break;
+				}
+			}
+		});
+
+		Subscription::run_with_id(self.term.id, select(term_event_stream, ipc_event_stream))
 	}
 
 	fn update(&mut self, event: Event) -> Task<Event> {
 		match event {
+			Event::Toggle => {
+				self.expanded = !self.expanded;
+				Task::none()
+			}
+			Event::IpcError(error) => {
+				self.status = format!("IPC ERROR: {error}");
+				Task::none()
+			}
+			Event::Ipc(IpcRequest::SetStatus(status)) => {
+				self.status = status;
+				Task::none()
+			}
+			Event::Ipc(IpcRequest::SetProgress(progress)) => {
+				self.progress = progress;
+				Task::none()
+			}
 			Event::Terminal(iced_term::Event::CommandReceived(_, cmd)) => {
 				let is_init_task = matches!(cmd, iced_term::Command::InitBackend(_));
 
@@ -106,14 +175,16 @@ impl App {
 				// BUG/HACK: Address race condition with InitBackend/ProcessBackendCommand(Resize) and layout_width/num_cols limiting the terminal size
 				// TODO: Report to iced_term
 				if is_init_task {
-					task.chain(Task::done(Event::Terminal(iced_term::Event::CommandReceived(
-						self.term.id,
-						iced_term::Command::ChangeFont(iced_term::settings::FontSettings {
-							size: 14.0,
-							font_type: Font::MONOSPACE,
-							..Default::default()
-						}),
-					))))
+					task.chain(Task::done(Event::Terminal(
+						iced_term::Event::CommandReceived(
+							self.term.id,
+							iced_term::Command::ChangeFont(iced_term::settings::FontSettings {
+								size: 14.0,
+								font_type: Font::MONOSPACE,
+								..Default::default()
+							}),
+						),
+					)))
 				} else {
 					task
 				}
@@ -122,12 +193,33 @@ impl App {
 	}
 
 	fn view(&self) -> Element<Event, Theme, iced::Renderer> {
-		container(TerminalView::show(&self.term).map(Event::Terminal))
-			.width(Length::Fill)
-			.height(Length::Fill)
-			.padding(4)
-			.style(|_| container::background(Color::from_rgb(12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0)))
+		let button = row![
+			Button::new(if self.expanded { "v" } else { ">" }).on_press(Event::Toggle),
+			"Details",
+		];
+
+		let details: Element<Event, Theme, iced::Renderer> = if self.expanded {
+			column![
+				button,
+				container(TerminalView::show(&self.term).map(Event::Terminal))
+					.width(Length::Fill)
+					.height(Length::Fill)
+			]
 			.into()
+		} else {
+			button.into()
+		};
+
+		column![
+			text(self.status.clone()),
+			progress_bar(0.0..=100.0, self.progress),
+			details,
+		]
+		.width(Length::Fill)
+		.height(Length::Fill)
+		.padding(5)
+		.spacing(5)
+		.into()
 	}
 }
 

@@ -7,6 +7,7 @@ pub mod patch;
 #[cfg(feature = "patch")]
 mod gui;
 
+mod ipc;
 mod vdf;
 
 const ABOUT: &str = "GModPatchTool (formerly GModCEFCodecFix)

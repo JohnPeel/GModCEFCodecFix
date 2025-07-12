@@ -17,6 +17,7 @@ const PATCH_SERVER_ROOTS: [&str; 2] = [
 //const GMOD_STEAM_APPID: u64 = 4000;
 const BLANK_FILE_HASH: &str = "null";
 
+use crate::ipc::Send;
 use crate::*;
 
 use serde::Deserialize;
@@ -72,7 +73,10 @@ struct Args {
 
 	/// Allow running the tool as root/admin (NOT RECOMMENDED!!!)
 	#[arg(long)]
-	run_as_root_with_security_risk: bool
+	run_as_root_with_security_risk: bool,
+
+	#[arg(long, hide = true, default_value_t = false)]
+	enable_ipc: bool,
 }
 
 const COLOR_LOOKUP: Map<&'static str, &'static str> =
@@ -684,6 +688,20 @@ where
 	let now = Instant::now();
 	let sys = System::new_all();
 
+	let mut client = if args.enable_ipc {
+		match ipc::connect::<gui::IpcRequest, gui::IpcResponse>().await {
+			Ok(client) => Some(client),
+			Err(error) => {
+				terminal_write(writer, &format!("failed to connect to IPC: {error}"), true, writer_is_interactive.then_some("red"));
+				None
+			}
+		}
+	} else {
+		None
+	};
+
+	let _ = client.send(gui::IpcRequest::SetStatus("Hello, World!".to_owned())).await;
+
 	// Abort if another instance is already running
 	let pid_path = extend_pathbuf_and_return(std::env::current_exe().unwrap().parent().unwrap().to_path_buf(), &["gmodpatchtool.pid"]);
 	let running_instance_pid = tokio::fs::read_to_string(&pid_path).await;
@@ -772,6 +790,7 @@ where
 	}
 
 	// Find Steam
+	#[allow(unused_assignments)]
 	let mut steam_path = None;
 	if let Some(steam_path_arg) = args.steam_path {
 		// Make sure the path the user is forcing actually exists
